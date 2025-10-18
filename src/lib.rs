@@ -1,106 +1,164 @@
 use {
-    alloy_primitives::{U256, utils::parse_units},
-    serde::{Deserialize, Deserializer, Serializer, de::Error as DeError},
+    alloy_primitives::{
+        U256, uint,
+        utils::{format_units_with, parse_units},
+    },
+    serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError},
 };
 
-fn alloy_to_decimal_str(v: &U256) -> String {
-    // serialize as decimal wei by default (unambiguous)
-    v.to_string()
+#[test]
+fn test_parse_units() {
+    let res = parse_units("0.001", "wei");
+    println!("{:?}", res);
+
+    let res = format_units_with(1, "gwei", Default::default());
+
+    println!("{:?}", res);
 }
 
 pub fn deserialize<'de, D>(deserializer: D) -> Result<U256, D::Error>
 where
     D: Deserializer<'de>,
 {
-    // Accept either a string (with optional unit) or a bare integer
-    // We deserialize into a serde_json::Value-like enum via an untagged helper.
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Raw {
         Str(String),
         U64(u64),
         U128(u128),
-        // If you expect very large bare numbers in TOML/YAML, add String only and
-        // let users quote them. Most formats cap bare integer size.
     }
 
     let raw = Raw::deserialize(deserializer)?;
 
-    let (num_str, unit) = match raw {
-        Raw::U64(n) => (n.to_string(), "wei".to_string()),
-        Raw::U128(n) => (n.to_string(), "wei".to_string()),
+    let (num_str, unit_str) = match raw {
+        Raw::U64(n) => (n.to_string(), String::from("wei")),
+        Raw::U128(n) => (n.to_string(), String::from("wei")),
         Raw::Str(s0) => {
             let s = s0.trim();
             if s.is_empty() {
                 return Err(D::Error::custom("empty value"));
             }
 
-            // Allow "1 ether", "1ether", "2 gwei", "100 wei", or just a big decimal string.
-            // Split numeric and alpha parts from the right.
-            let mut letters = String::new();
+            let mut unit_len = 0usize;
+            for ch in s.chars().rev() {
+                if ch.is_ascii_alphabetic() {
+                    unit_len += ch.len_utf8();
+                } else if ch.is_whitespace() && unit_len == 0 {
+                    continue;
+                } else {
+                    break;
+                }
+            }
 
-            // If there's whitespace, just split on it first; else fall back to scanning suffix.
-            if let Some((lhs, rhs)) = s.rsplit_once(char::is_whitespace) {
-                let lhs = lhs.trim();
-                let rhs = rhs.trim();
-                if rhs.eq_ignore_ascii_case("ether")
-                    || rhs.eq_ignore_ascii_case("eth")
-                    || rhs.eq_ignore_ascii_case("gwei")
-                    || rhs.eq_ignore_ascii_case("wei")
-                {
-                    (lhs.to_string(), rhs.to_string())
-                } else {
-                    // treat entire string as number (in wei)
-                    (s.to_string(), "wei".to_string())
-                }
+            if unit_len > 0 {
+                let split_at = s.len() - unit_len;
+                let (num_part, unit_part) = s.split_at(split_at);
+                (num_part.trim().to_string(), unit_part.trim().to_string())
             } else {
-                // No whitespace: split trailing letters
-                for ch in s.chars().rev() {
-                    if ch.is_ascii_alphabetic() {
-                        letters.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if !letters.is_empty() {
-                    let unit_rev: String = letters.chars().collect();
-                    let unit_clean = unit_rev.chars().rev().collect::<String>();
-                    let num_len = s.len() - unit_clean.len();
-                    if num_len == 0 {
-                        return Err(D::Error::custom("missing number before unit"));
-                    }
-                    let number_part = &s[..num_len];
-                    (number_part.to_string(), unit_clean)
-                } else {
-                    (s.to_string(), "wei".to_string())
-                }
+                (s.to_string(), String::from("wei"))
             }
         }
     };
 
-    // Normalize unit
-    let unit_norm = match unit.to_ascii_lowercase().as_str() {
-        "eth" => "ether",
-        "ether" => "ether",
+    let unit_norm = match unit_str.to_ascii_lowercase().as_str() {
+        "eth" | "ether" => "ether",
         "gwei" => "gwei",
         "wei" => "wei",
         other => return Err(D::Error::custom(format!("unknown unit: {other}"))),
     };
 
-    // Strip underscores from the numeric part to allow 1_000_000 style
-    let num_clean = num_str.replace('_', "");
+    let mut cleaned = String::with_capacity(num_str.len());
+    let mut seen_dot = false;
+    let mut prev: Option<char> = None;
 
-    // parse_units handles decimals for ether/gwei; for wei, it expects integer
-    let parsed = parse_units(&num_clean, unit_norm)
-        .map_err(|e| D::Error::custom(format!("invalid value `{num_clean} {unit_norm}`: {e}")))?
+    for (i, ch) in num_str.chars().enumerate() {
+        match ch {
+            '0'..='9' => {
+                cleaned.push(ch);
+            }
+            '.' => {
+                if unit_norm == "wei" {
+                    return Err(D::Error::custom("decimals not allowed for wei"));
+                }
+                if seen_dot {
+                    return Err(D::Error::custom("multiple decimal points"));
+                }
+                if matches!(prev, Some('_')) {
+                    return Err(D::Error::custom(
+                        "underscore cannot be adjacent to decimal point",
+                    ));
+                }
+                seen_dot = true;
+                cleaned.push('.');
+            }
+            '_' => {
+                if i == 0 || i == num_str.len() - 1 {
+                    return Err(D::Error::custom("underscore cannot be at start or end"));
+                }
+                if matches!(prev, Some('_')) {
+                    return Err(D::Error::custom("consecutive underscores are not allowed"));
+                }
+                if matches!(prev, Some('.')) {
+                    return Err(D::Error::custom(
+                        "underscore cannot be adjacent to decimal point",
+                    ));
+                }
+                cleaned.push('_');
+            }
+            c if c.is_whitespace() => {
+                return Err(D::Error::custom("whitespace inside number is not allowed"));
+            }
+            _ => {
+                return Err(D::Error::custom(format!(
+                    "invalid character in number: `{ch}`"
+                )));
+            }
+        }
+        prev = Some(ch);
+    }
+
+    let cleaned = cleaned.replace('_', "");
+    if cleaned.is_empty() || cleaned == "." {
+        return Err(D::Error::custom("invalid empty/decimal-only number"));
+    }
+    if unit_norm == "wei" && cleaned.contains('.') {
+        return Err(D::Error::custom("decimals not allowed for wei"));
+    }
+    let parsed = parse_units(&cleaned, unit_norm)
+        .map_err(|e| D::Error::custom(format!("invalid value `{cleaned} {unit_norm}`: {e}")))?
         .into();
+
     Ok(parsed)
+}
+
+#[inline]
+fn pick_unit_human_friendly(v: &U256) -> &'static str {
+    // 0.0001 ether = 1e14 wei
+    const ETHER_MIN: U256 = uint!(100_000_000_000_000U256);
+    // 0.0001 gwei = 1e5 wei
+    const GWEI_MIN: U256 = uint!(100_000U256);
+
+    if *v >= ETHER_MIN {
+        "ether"
+    } else if *v >= GWEI_MIN {
+        "gwei"
+    } else {
+        "wei"
+    }
 }
 
 pub fn serialize<S>(v: &U256, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    // Serialize back as decimal wei string to avoid surprises
-    serializer.serialize_str(&alloy_to_decimal_str(v))
+    if serializer.is_human_readable() {
+        use serde::ser::Error;
+
+        let unit = pick_unit_human_friendly(v);
+        let s = format_units_with(*v, unit, Default::default()).map_err(S::Error::custom)?;
+
+        serializer.serialize_str(&format!("{s} {unit}"))
+    } else {
+        v.serialize(serializer)
+    }
 }
