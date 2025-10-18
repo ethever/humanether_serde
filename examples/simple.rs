@@ -8,6 +8,13 @@ struct A {
     #[serde(with = "humanether_serde")]
     gas: U256,
 }
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug)]
+struct B {
+    #[serde(with = "humanether_serde")]
+    gas: u128,
+}
+
 fn main() {
     let a = A {
         gas: uint!(1000000000000000_U256),
